@@ -1,0 +1,160 @@
+diff --git a/src/ppu.c b/src/ppu.c
+index 628e564..9aa0056 100644
+--- a/src/ppu.c
++++ b/src/ppu.c
+@@ -127,7 +127,21 @@ static uint32 scanlines_per_frame;
+ 
+ uint8 PPU[4];
+ uint8 PPUSPL;
+-uint8 NTARAM[0x800], PALRAM[0x20], SPRAM[0x100], SPRBUF[0x100];
++uint8 NTARAM[0x800], PALRAM[0x20], SPRAM[0x100], SPRBUF[0x300];
++
++/* NenketsuSoccer extension (Goal 3, 11 v 11): a second table of up to 128 sprites, drawn behind the
++ * 64 of SPRAM. A ROM finds it by reading $401C ($58 here; open bus on other emulators) and uses it a
++ * picture at a time:
++ *   $401E (write) the picture begins: the waiting table empty, and OAM DMAs ($4014) keep the
++ *         sprites they had (the last whole picture) until the picture is ready;
++ *   $401D (write) a CPU page into the waiting table, in front of what it holds (the table is 128
++ *         sprites: the picture's first 64, then its next 64 in front of them);
++ *   $401F (write) the picture is ready: the next OAM DMA takes the page as usual, the waiting table
++ *         becomes the second table, and DMAs work as before.
++ * Nothing else touches $401C-$401F, a reset or a loaded state empties the table (save states stay the
++ * stock core's, loadable both ways), and with it empty sprites are drawn
++ * exactly as before. */
++static uint8 SPRAM2[0x200], SPRAM2P[0x200], SPRKEEP[0x100], spr2ready, spr2on, spr2hold;
+ uint8 UPALRAM[0x03];/* for 0x4/0x8/0xC addresses in palette, the ones in
+ 					 * 0x20 are 0 to not break fceu rendering.
+ 					 */
+@@ -345,9 +359,44 @@ static DECLFW(B2007) {
+ static DECLFW(B4014) {
+ 	uint32 t = V << 8;
+ 	int x;
++	int keep = spr2hold && !spr2ready;
+ 
++	if (keep)
++		memcpy(SPRKEEP, SPRAM, 0x100);
+ 	for (x = 0; x < 256; x++)
+ 		X6502_DMW(0x2004, X6502_DMR(t + x));
++	if (keep)
++		memcpy(SPRAM, SPRKEEP, 0x100);
++	if (spr2ready) {
++		memcpy(SPRAM2, SPRAM2P, 0x200);
++		spr2ready = spr2hold = 0;
++		spr2on = 0;
++		for (x = 0; x < 0x200; x += 4)
++			if (SPRAM2[x] < 0xEF) spr2on = 1;
++	}
++}
++
++static DECLFR(A401C) {
++	return 0x58;
++}
++
++static DECLFW(B401D) {
++	uint32 t = V << 8;
++	int x;
++
++	memmove(SPRAM2P + 0x100, SPRAM2P, 0x100);
++	for (x = 0; x < 256; x++)
++		SPRAM2P[x] = ARead[t + x](t + x);
++}
++
++static DECLFW(B401E) {
++	memset(SPRAM2P, 0xF8, 0x200);
++	spr2ready = 0;
++	spr2hold = 1;
++}
++
++static DECLFW(B401F) {
++	spr2ready = 1;
+ }
+ 
+ #define PAL(c)  ((c) + cc)
+@@ -876,6 +925,53 @@ static void FetchSpriteData(void) {
+ 			PPU_hook(vofs);
+ 		}
+ 	}
++
++	/* The second table (see SPRAM2): after the first, so behind it; up to 192 a line when the
++	 * 8-a-line limit is off, 8 in all when it is on. */
++	if (spr2on && !PPU_hook) {
++		int lim = (maxsprites > 8) ? 192 : maxsprites;
++		spr = (SPR*)SPRAM2;
++		for (n = 127; n >= 0; n--, spr++) {
++			if ((uint32)(scanline - spr->y) >= H) continue;
++			if (ns >= lim) break;
++			{
++				SPRB dst;
++				uint8 *C;
++				int t;
++				uint32 vadr;
++
++				t = (int)scanline - (spr->y);
++
++				if (Sprite16)
++					vadr = ((spr->no & 1) << 12) + ((spr->no & 0xFE) << 4);
++				else
++					vadr = (spr->no << 4) + vofs;
++
++				if (spr->atr & V_FLIP) {
++					vadr += 7;
++					vadr -= t;
++					vadr += (P0 & 0x20) >> 1;
++					vadr -= t & 8;
++				} else {
++					vadr += t;
++					vadr += t & 8;
++				}
++
++				if (MMC5Hack && geniestage != 1)
++					C = MMC5SPRVRAMADR(vadr);
++				else
++					C = VRAMADR(vadr);
++
++				dst.ca[0] = C[0];
++				dst.ca[1] = C[8];
++				dst.x = spr->x;
++				dst.atr = spr->atr;
++
++				*(uint32*)&SPRBUF[ns << 2] = *(uint32*)&dst;
++			}
++			ns++;
++		}
++	}
+ 	numsprites = ns;
+ 	SpriteBlurp = sb;
+ }
+@@ -1081,6 +1177,9 @@ void FCEUPPU_Reset(void) {
+ 	vtoggle = 0;
+ 	ppudead = 2;
+ 	kook = 0;
++	memset(SPRAM2, 0xF8, 0x200);
++	memset(SPRAM2P, 0xF8, 0x200);
++	spr2ready = spr2on = spr2hold = 0;
+ }
+ 
+ void FCEUPPU_Power(void) {
+@@ -1111,6 +1210,11 @@ void FCEUPPU_Power(void) {
+ 	}
+ 
+ 	BWrite[0x4014] = B4014;
++
++	ARead[0x401C] = A401C;
++	BWrite[0x401D] = B401D;
++	BWrite[0x401E] = B401E;
++	BWrite[0x401F] = B401F;
+ }
+ 
+ 
+@@ -1254,6 +1358,11 @@ static uint16 TempAddrT, RefreshAddrT;
+ void FCEUPPU_LoadState(int version) {
+ 	TempAddr = TempAddrT;
+ 	RefreshAddr = RefreshAddrT;
++	/* (the second sprite table isn't in save states, so they stay the stock core's, loadable both
++	 * ways: a loaded state starts with it empty, until the ROM's next picture) */
++	memset(SPRAM2, 0xF8, 0x200);
++	memset(SPRAM2P, 0xF8, 0x200);
++	spr2ready = spr2on = spr2hold = 0;
+ }
+ 
+ SFORMAT FCEUPPU_STATEINFO[] = {
